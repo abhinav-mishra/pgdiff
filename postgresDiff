@@ -1,0 +1,662 @@
+#!/bin/sh
+
+log_file="/var/log/oslog/DBUPGRADE.log"
+# Optional configuration:
+PGBINDIR=${PGBINDIR:-"/mswitch/pgsql/bin"}
+PGCWORKDIR=${PGCWORKDIR:-"/tmp/pgdiff"}
+PSQL="${PGBINDIR}/psql --pset pager=off "
+
+### Capture default URI based on what's in the environment
+###  Use PGHOST/PGUSER/PGPORT if assigned
+
+PGDB=${PGDB:-"comparisondatabase"}
+PGHOST=${PGHOST:-"localhost"}
+PGUSER=${PGUSER:-"root"}
+PGPORT=${PGPORT:-"5432"}
+URIC="postgresql://${PGUSER}@${PGHOST}:${PGPORT}/${PGDB}"
+PGURI=${PGURI:-${URIC}}
+
+PGCOMITSCHEMAS=${PGCOMITSCHEMAS:-"('pg_catalog','information_schema')"}
+
+PGDB1=${DB1:-"db"}
+URIC1="postgresql://${PGUSER}@${PGHOST}:${PGPORT}/${PGDB1}"
+PGURI1=${PGURI1:-${URIC1}}
+PGCLABEL1=${PGCLABEL1:-"db1"}
+PGCMPOUTPUT1=${PGCMPOUTPUT1:-"${PGCWORKDIR}/pgdiff-file1"}
+
+PGDB2=${DB2:-"db_tmp"}
+URIC2="postgresql://${PGUSER}@${PGHOST}:${PGPORT}/${PGDB2}"
+PGURI2=${PGURI2:-${URIC2}}
+PGCLABEL2=${PGCLABEL2:-"db2"}
+PGCMPOUTPUT2=${PGCMPOUTPUT2:-"${PGCWORKDIR}/pgdiff-file2"}
+
+PGCEXPLANATIONS=${PGCEXPLANATIONS:-"${PGCWORKDIR}/explanations.txt"}
+PGCFULLOUTPUT=${PGCFULLOUTPUT:-"${PGCWORKDIR}/fulloutput.txt"}
+PGCUNEXPLAINED=${PGCUNEXPLAINED:-"${PGCWORKDIR}/unexplained.txt"}
+PGCBADEXPLAIN=${PGCBADEXPLAIN:-"${PGCWORKDIR}/badexplanations.txt"}
+PGCMPINPUT1=${PGCMPINPUT1:-"${PGCWORKDIR}/pgdiff-file1"}
+PGCMPINPUT2=${PGCMPINPUT2:-"${PGCWORKDIR}/pgdiff-file2"}
+
+echo "Creating temporary DB comparisondatabase" | tee -a $log_file
+createdb comparisondatabase | tee -a $log_file
+
+extract_schema_data () {
+    local PGCLABEL=$1
+
+# Pull data for major object types:
+
+# BLANK is just a place-holder to establish the names and data types for the elements in the giant UNION query
+    BLANK=" select 'header'::text as object_type, 'schema'::text as object_schema, 'name'::text as object_name, 'definition'::text as object_definition "
+
+# Roles
+    RQ=" select 'role', NULL::text, rolname, 'rolcreaterole:'|| (rolcreaterole::text) || ',rolcreatedb:' || (rolcreatedb::text) ||',rolcanlogin:'||(rolcanlogin::text)
+from pg_catalog.pg_roles"
+
+# Schemas
+# a) Existence
+    SCEQ="
+select 'schema', schema_name, schema_name, schema_owner from information_schema.schemata"
+
+# b) Permissions
+    SCP="select object_type::text, object_schema::text, object_name::text, object_value::text from (with sp as (select 'schema permissions' as object_type, nspname as object_schema, nspname as object_name, unnest(nspacl)::text as acl_breakdown, position('=' in unnest(nspacl)::text)::integer as acl_separator_pos from pg_catalog.pg_namespace)
+select object_type, object_schema, object_name || ':' || coalesce(substr(acl_breakdown, 0, acl_separator_pos), '')::text as object_name, coalesce(substr(acl_breakdown, acl_separator_pos), '')::text as object_value from sp) as sp "
+
+
+# Tables
+    TEQ="
+select case when table_type = 'BASE TABLE' then 'table'
+            when table_type = 'VIEW' then 'view'
+            else 'other relation' end,
+table_schema,
+table_schema || '.' || table_name, NULL::text
+from information_schema.tables"
+
+    TOWN="
+select case when c.relkind = 'r' then 'table owner'
+            when c.relkind = 'v' then 'view owner' end, 
+        n.nspname,
+        n.nspname || '.' || c.relname, r.rolname
+from pg_class c, pg_namespace n, pg_roles r
+where n.oid = c.relnamespace and r.oid = c.relowner
+and c.relkind in ('v', 'r')"
+
+    COLS="
+select 'column', table_schema, table_schema|| '.' || table_name || '.' || column_name,
+'type:' || data_type || 
+',maxlen:' || coalesce(character_maximum_length::text, coalesce(character_octet_length::text, coalesce(numeric_precision::text, 'n/a'))) ||
+',nullable:'||is_nullable || ',default:' ||  coalesce(column_default, 'NULL')
+from information_schema.columns"
+
+    TSTORAGE="
+select 'options', n.nspname,
+        n.nspname || '.' || c.relname, 
+        unnest(c.reloptions)
+from pg_class c, pg_namespace n
+where n.oid = c.relnamespace and c.reloptions is not null"
+
+    TPERM="
+select case when c.relkind = 'r' then 'table permissions'
+            when c.relkind = 'S' then 'sequence permissions'
+            when c.relkind = 'v' then 'view permissions' end,
+       n.nspname,
+       n.nspname || '.' || c.relname, unnest(c.relacl)::text
+from pg_class c, pg_namespace n, pg_roles r
+where n.oid = c.relnamespace and r.oid = c.relowner
+and c.relkind in ('v', 'r', 'S')"
+
+    TPERM="
+select object_type::text, object_schema::text, object_name::text, object_value::text
+from
+(with tp as
+  (select 
+       case when c.relkind = 'r' then 'table permissions'
+            when c.relkind = 'S' then 'sequence permissions'
+            when c.relkind = 'v' then 'view permissions' end as object_type,
+       n.nspname::text as object_schema,
+       (n.nspname || '.' || c.relname)::text as object_name,
+       unnest(c.relacl)::text as perm,
+       position('=' in unnest(c.relacl)::text)::integer as perm_separator
+   from pg_class c, pg_namespace n, pg_roles r
+   where n.oid = c.relnamespace and r.oid = c.relowner
+     and c.relkind in ('v', 'r', 'S'))
+  select object_type, object_schema, 
+         object_name || ':' || coalesce(substr(perm, 0, perm_separator), '')::text as object_name, 
+         coalesce(substr(perm, perm_separator), '')::text as object_value from tp)
+as tperms"
+
+    TSEQ="
+select 'sequence', sequence_schema, sequence_schema || '.' || sequence_name, 
+    'start:' || start_value::text || ',min:' || minimum_value::text || ',max:' || maximum_value::text || ',increment:' || increment::text || ',cycles:' || cycle_option
+from information_schema.sequences"
+
+    VDEF="
+select 'view definition', table_schema, table_schema|| '.' || table_name, view_definition
+from information_schema.views"
+
+
+    FCODE="
+select 'function definition', r.specific_schema, r.specific_schema || '.' || p.oid::regprocedure::text, r.routine_definition 
+from information_schema.routines r, pg_catalog.pg_proc p 
+where r.specific_name = p.proname || '_' || p.oid "
+
+    FPERM1="
+select 'function permissions', rp.specific_schema, p.oid::regprocedure::text || '-role:' || rp.grantee,
+'privilege_type:' || rp.privilege_type || ',is_grantable:' || rp.is_grantable
+from information_schema.routine_privileges rp, pg_proc p
+where rp.specific_name = p.proname || '_' || p.oid"
+
+    FOWNER="
+select 'function owner', n.nspname, p.oid::regprocedure::text, r.rolname
+from pg_catalog.pg_roles r, pg_catalog.pg_proc p, pg_catalog.pg_namespace n
+where r.oid = p.proowner and n.oid = p.pronamespace"
+
+    FLANGUAGE="
+select 'function language', r.specific_schema, r.specific_schema || '.' || p.oid::regprocedure::text, r.external_language
+from information_schema.routines r, pg_catalog.pg_proc p
+where
+    r.specific_name = p.proname || '_' || p.oid "
+
+    FSECTYPE="
+select 'function security type', r.specific_schema, r.specific_schema || '.' || p.oid::regprocedure::text, r.security_type
+from information_schema.routines r, pg_catalog.pg_proc p
+where 
+    r.specific_name = p.proname || '_' || p.oid"
+
+    FCONFIG="
+select 'function config', n.nspname, p.oid::regprocedure::text, p.proconfig::text
+from pg_catalog.pg_proc p, pg_catalog.pg_namespace n
+where n.oid = p.pronamespace"
+
+    TRIGGERS="
+select 'trigger', t.trigger_schema, t.trigger_schema || '.' || t.event_object_table || '.' || t.trigger_name ||'/'|| t.event_manipulation, 'action:' || t.action_statement ||',orientation:'||t.action_orientation || ',timing:' || t.action_timing
+from information_schema.triggers t"
+
+    CHECKCON="
+select 'check constraint', n.nspname, n.nspname || '.' || r.relname || ':' || c.conname, consrc
+from
+   pg_catalog.pg_class r, pg_catalog.pg_namespace n, pg_catalog.pg_constraint c
+where
+   r.oid = c.conrelid and n.oid = c.connamespace and c.consrc is not null"
+
+    INDEXES="
+select 'index', schemaname, schemaname || '.' || tablename || ':' || indexname, indexdef
+from pg_catalog.pg_indexes"
+
+    FOREIGNKEYS="
+select 'foreign key', constraint_schema, constraint_schema || '.' || c.relname || ':' || constraint_name,
+unique_constraint_schema || '.' || unique_constraint_name || ',match:' || match_option || ',update_rule:' || update_rule || ',delete_rule:' || delete_rule
+from pg_catalog.pg_class c, pg_catalog.pg_constraint pc, information_schema.referential_constraints rc, pg_catalog.pg_namespace n
+where
+   rc.constraint_schema = n.nspname and
+   rc.constraint_name = pc.conname and
+   pc.conrelid = c.oid and
+   c.relnamespace = n.oid"
+
+    TYPES="
+select 'data type', n.nspname, n.nspname || '.' || t.typname, 'length:'||t.typlen::text || ',byval:'||t.typbyval::text||',phystype:'||t.typtype||',category:'||t.typcategory||',ispreferred:'||t.typispreferred::text||',delimiter:'||t.typdelim||'input:'||t.typinput::text||'output:'||t.typoutput::text||'receive:'||t.typreceive::text||'send:'||t.typsend::text||'modin:'||t.typmodin::text||'modout:'||t.typmodout::text||'analyze:'||t.typanalyze::text||'align:'||t.typalign::text||'storage:'||t.typstorage::text||'notnull:'||t.typnotnull::text||'typmod:'||t.typtypmod::text||'ndims:'||t.typndims::text||'collation:'||t.typcollation::text
+from pg_catalog.pg_type t, pg_namespace n
+where t.typnamespace = n.oid"
+
+    TYPEOWNERS="
+select 'data type owner', n.nspname, n.nspname || '.' || t.typname, u.usename
+from pg_catalog.pg_type t, pg_namespace n, pg_user u
+where 
+   t.typnamespace = n.oid and u.usesysid = t.typowner"
+
+    OPERATORS="
+select 'operator', n.nspname, n.nspname || '.' || t.oprname,
+'kind:'|| t.oprkind::text ||
+',canmerge:'|| t.oprcanmerge::text ||
+',canhash:'|| t.oprcanhash::text ||
+',left:'|| t.oprleft::text ||
+',right:'|| t.oprright::text ||
+',result:'|| t.oprresult::text ||
+',com:'|| t.oprcom::text ||
+',negate:'|| t.oprnegate::text ||
+',code:'|| t.oprcode::text ||
+',rest:'|| t.oprrest::text ||
+',join:'|| t.oprjoin::text
+from pg_catalog.pg_operator t, pg_catalog.pg_namespace n
+where 
+t.oprnamespace = n.oid"
+
+    OPOWNERS="
+select 'operator owner', n.nspname, n.nspname || '.' || o.oprname, u.usename
+from pg_catalog.pg_operator o, pg_namespace n, pg_user u
+where 
+   o.oprnamespace = n.oid and u.usesysid = o.oprowner"
+
+    EVERYTHING="
+copy ( with pgd_all_data (object_type, object_schema, object_name, object_definition)
+      as (
+${BLANK}
+UNION ALL
+${RQ} 
+UNION ALL
+${SCEQ}
+UNION ALL
+${SCP}
+UNION ALL
+${TEQ}
+UNION ALL
+${TOWN}
+UNION ALL
+${TSTORAGE}
+UNION ALL
+${TPERM}
+UNION ALL
+${COLS}
+UNION ALL
+${TSEQ}
+UNION ALL
+${VDEF}
+UNION ALL
+${FCODE}
+UNION ALL
+${FPERM1}
+UNION ALL
+${FOWNER}
+UNION ALL
+${FLANGUAGE}
+UNION ALL
+${FSECTYPE}
+UNION ALL
+${FCONFIG}
+UNION ALL
+${TRIGGERS}
+UNION ALL
+${CHECKCON}
+UNION ALL
+${INDEXES}
+UNION ALL
+${FOREIGNKEYS}
+UNION ALL
+${TYPES}
+UNION ALL
+${TYPEOWNERS}
+UNION ALL
+${OPERATORS}
+UNION ALL
+${OPOWNERS} )
+select '${PGCLABEL}', object_schema, object_type, object_name, object_definition from pgd_all_data
+   where object_schema not in (select nspname from pg_catalog.pg_namespace where nspname in ${PGCOMITSCHEMAS} or nspname = 'pg_toast' or nspname like 'pg_temp_%' or nspname like 'pg_toast_temp_%')
+)
+to stdout;"
+
+    echo "${EVERYTHING}"
+}
+
+
+compare_data () {
+
+    COMPARESCRIPT="
+drop table if exists data_raw cascade;
+create table data_raw (
+    label text,
+    id serial,
+    primary key (id),
+    object_schema text,
+    object_type text,
+    object_name text,
+    object_definition text
+);
+comment on column data_raw.label is 'Label indicating data source';
+comment on column data_raw.id is 'unique value to help construct primary key';
+comment on column data_raw.object_schema is 'namespace (pg_namespace) containing the object';
+comment on column data_raw.object_type is 'type of object';
+comment on column data_raw.object_name is 'fully qualified name of the object';
+comment on column data_raw.object_definition is 'definition of the object';
+
+create index db1_tnd on data_raw(object_type, object_name);
+truncate data_raw;
+
+\\copy data_raw (label, object_schema, object_type, object_name, object_definition) from '${PGCMPINPUT1}';
+\\copy data_raw (label, object_schema, object_type, object_name, object_definition) from '${PGCMPINPUT2}';
+
+update data_raw set object_definition = '' where object_definition is null;
+
+drop table if exists raw_differences cascade;
+create table raw_differences (
+  object_schema text,
+  object_name text,
+  object_type text,
+  label1 text,
+  id1 integer references data_raw(id),
+  object_definition1 text,
+  label2 text, 
+  id2 integer references data_raw(id),
+  object_definition2 text,
+  difference_type text,
+  importance integer
+);
+
+comment on column raw_differences.object_schema is 'namespace containing the object';
+comment on column raw_differences.object_name is 'fully qualified object name';
+comment on column raw_differences.object_type is 'type of object';
+comment on column raw_differences.label1 is 'Label of 1st data source';
+comment on column raw_differences.id1 is 'ID of raw data in 1st data source';
+comment on column raw_differences.object_definition1 is 'Definition of object in 1st data source';
+comment on column raw_differences.label2 is 'Label of 2nd data source';
+comment on column raw_differences.id2 is 'ID of raw data in 2nd data source';
+comment on column raw_differences.object_definition2 is 'Definition of object in 2nd data source';
+comment on column raw_differences.difference_type is 'type of difference recognized';
+comment on column raw_differences.importance is 'Priority of difference - low values are most important';
+
+--- Find all the items that generally match...
+insert into raw_differences (label1, id1, object_type, object_schema, object_name, object_definition1, 
+                             label2, id2, object_definition2, difference_type)
+select r1.label, r1.id, r1.object_type, r1.object_schema, r1.object_name, r1.object_definition,
+       r2.label, r2.id, r2.object_definition,
+       case when r1.object_definition = r2.object_definition then 'match'
+            else 'mismatch' end
+from data_raw r1, data_raw r2
+where r1.label = '${PGCLABEL1}' and
+      r2.label = '${PGCLABEL2}' and
+      r1.object_type = r2.object_type and
+      r1.object_name = r2.object_name;
+
+insert into raw_differences (label1, id1, object_type, object_schema, object_name, object_definition1, difference_type)
+select r1.label, r1.id, r1.object_type, r1.object_schema, r1.object_name, r1.object_definition, 'missing in 2nd DB'
+from data_raw r1
+where not exists (select 1 from data_raw r2 where
+                 r1.object_type = r2.object_type and
+                 r1.object_name = r2.object_name);
+
+insert into raw_differences (label1, id1, object_type, object_schema, object_name, object_definition1, difference_type)
+select r1.label, r1.id, r1.object_type, r1.object_schema, r1.object_name, r1.object_definition, 'missing in 2nd DB'
+from data_raw r1
+where 
+     r1.label = '${PGCLABEL1}' and
+     not exists (select 1 from data_raw r2 where
+                 r1.object_type = r2.object_type and
+                 r1.object_name = r2.object_name and r2.label <> r1.label)
+union all
+select r1.label, r1.id, r1.object_type, r1.object_schema, r1.object_name, r1.object_definition, 'missing in 1st DB'
+from data_raw r1
+where 
+     r1.label = '${PGCLABEL2}' and
+     not exists (select 1 from data_raw r2 where
+                 r1.object_type = r2.object_type and
+                 r1.object_name = r2.object_name and r2.label <> r1.label);
+
+create index rd_label1 on raw_differences(label1);
+create index rd_id1 on raw_differences(id1);
+create index rd_type on raw_differences(object_type);
+create index rd_name on raw_differences(object_name);
+create index rd_schema on raw_differences(object_schema);
+create index rd_label2 on raw_differences(label2);
+create index rd_id2 on raw_differences(id2);
+
+update raw_differences 
+  set importance = NULL
+  where difference_type = 'match';
+
+update raw_differences 
+  set importance = 1
+  where difference_type = 'mismatch';
+
+update raw_differences 
+  set importance = 2
+  where difference_type like 'missing in % DB';
+
+-- If schema is missing, then bump up all importances for all objects
+-- in that schema to indicate diminished importance
+update raw_differences
+  set importance = importance + 1
+  where difference_type like 'missing in %DB' and
+        object_schema in (select object_schema from raw_differences where difference_type like 'missing in %DB' and object_type = 'schema')
+        and object_type <> 'schema' ;
+
+-- If table is missing, then bump up importances for subservient
+-- objects
+
+update raw_differences rd
+  set importance = importance + 1
+  where difference_type like 'missing in %DB' and
+        object_type in ('table owner', 'table permissions', 'trigger', 'column', 'foreign key', 'index') and exists
+        (select 1 from raw_differences rdt where rdt.difference_type like 'missing in %DB' and
+                       rdt.object_type = 'table' and rdt.object_schema = rd.object_schema and
+                       (rd.object_name = rdt.object_name or rd.object_name like (rdt.object_name || '.%')));
+
+update raw_differences rd
+  set importance = importance + 1
+  where difference_type like 'missing in %DB' and
+        object_type in ('column', 'view permissions', 'view owner', 'view definition') and exists
+        (select 1 from raw_differences rdt where rdt.difference_type like 'missing in %DB' and
+                       rdt.object_type = 'view' and rdt.object_schema = rd.object_schema and
+                       (rd.object_name = rdt.object_name or rd.object_name like (rdt.object_name || '.%')));
+
+update raw_differences rd
+  set importance = importance + 1
+  where difference_type like 'missing in %DB' and
+        object_type in ('sequence permissions') and exists
+        (select 1 from raw_differences rdt where rdt.difference_type like 'missing in %DB' and
+                       rdt.object_type = 'sequence' and rdt.object_schema = rd.object_schema and
+                       (rd.object_name = rdt.object_name or rd.object_name like (rdt.object_name || '.%')));
+
+update raw_differences rd
+  set importance = importance + 1
+  where difference_type like 'missing in %DB' and
+        object_type in ('data type owner') and exists
+        (select 1 from raw_differences rdt where rdt.difference_type like 'missing in %DB' and
+                       rdt.object_type = 'data type' and rdt.object_schema = rd.object_schema and
+                       (rd.object_name = rdt.object_name or rd.object_name like (rdt.object_name || '.%')));
+
+update raw_differences rd
+  set importance = importance + 1
+  where difference_type like 'missing in %DB' and
+        object_type in 
+               ('function definition', 'function config', 'function language',
+                'function owner', 'function permissions', 'function security type')
+         and exists
+        (select 1 from raw_differences rdt where rdt.difference_type like 'missing in %DB' and
+                       rdt.object_type = 'functiondefinition' and rdt.object_schema = rd.object_schema and
+                       (rd.object_name = rdt.object_name or rd.object_name like (rdt.object_name || '.%')));
+
+drop table if exists expected_differences cascade;
+create table expected_differences (
+    object_type text,
+    object_schema text,
+    object_name text,
+    difference_type text,
+    difference_cause text,
+    importance integer,
+    primary key(object_type, object_name, difference_type, difference_cause)
+);
+
+\\copy expected_differences from '${PGCEXPLANATIONS}';
+
+drop table if exists object_types cascade;
+create table object_types (
+   object_type text primary key,
+   description text
+);
+
+insert into object_types (object_type, description)
+values 
+('header', 'placeholder - ignore'),
+('index', 'index on table'),
+('check constraint', 'CHECK constraint on table'),
+('foreign key', 'foreign key constraint'),
+('data type', 'data type'),
+('data type owner', 'owner of data type'),
+('function config', 'stored function configuration (SET values and such)'),
+('function definition', 'definition of stored function'),
+('function language', 'language of implementation of stored function'),
+('function owner', 'who owns this stored function?'),
+('function security type', 'stored function SECURITY DEFINER (ala setuid)'),
+('function permissions', 'per-role privileges for a stored function'),
+('trigger', 'trigger'),
+('operator', 'operator'),
+('operator owner', 'owner of operator'),
+('view definition', 'definition of VIEW'),
+('view', 'basic information about VIEW'),
+('view owner', 'owner of VIEW'),
+('view permissions', 'permissions on VIEW'),
+('table definition', 'definition of TABLE'),
+('table', 'basic information about TABLE'),
+('table owner', 'owner of TABLE'),
+('table permissions', 'permissions on TABLE'),
+('schema', 'schema/NAMESPACE'),
+('schema permissions', 'permissions for schema'),
+('sequence', 'sequence object'),
+('sequence permissions', 'permissions for sequence object'),
+('role', 'role (user/abstract role)'),
+('column', 'attribute of table/view/sequence'),
+('options', 'table storage options');
+
+drop table if exists fulloutput;
+create table fulloutput (
+  object_name text,
+  object_schema text,
+  object_type text references object_types(object_type),
+  label1 text,
+  object_definition1 text,
+  label2 text,
+  object_definition2 text,
+  difference_type text,
+  difference_cause text,
+  importance integer
+);
+create index fo_main on fulloutput(object_name, object_type);
+
+--- Perform full reconciliation
+
+--- 1.   Expected case: perfect match, no explanation needed OR PROVIDED
+insert into fulloutput (object_name, object_schema, object_type, label1, object_definition1, label2, object_definition2, difference_type, difference_cause, importance)
+select object_name, object_schema, object_type, label1, object_definition1, label2, object_definition2, difference_type, NULL::text, importance
+from raw_differences r where difference_type = 'match' and not exists
+(select 1 from expected_differences d where r.object_name = d.object_name and r.object_type = d.object_type);
+
+--- 2.  Not so much expected...  Perfect match, but we have a
+---     reconciling entry indicating why there *shouldn't* be a match
+
+insert into fulloutput (object_name, object_schema, object_type, label1, object_definition1, label2, object_definition2, difference_type, difference_cause, importance)
+select r.object_name, r.object_schema, r.object_type, r.label1, r.object_definition1, r.label2, r.object_definition2, r.difference_type, d.difference_cause, r.importance
+from raw_differences r, expected_differences d where r.difference_type = 'match' and 
+r.object_name = d.object_name and r.object_type = d.object_type;
+
+--- 3.  Expected...   missing, and explained...
+
+insert into fulloutput (object_name, object_schema, object_type, label1, object_definition1, label2, object_definition2, difference_type, difference_cause, importance)
+select r.object_name, r.object_schema, r.object_type, r.label1, r.object_definition1, r.label2, r.object_definition2, r.difference_type, d.difference_cause, r.importance
+from raw_differences r, expected_differences d where r.difference_type in ('missing in 1st DB', 'missing in 2nd DB') and 
+r.object_name = d.object_name and r.object_type = d.object_type;
+
+--- 4.  Not expected...   missing, and NOT explained...
+
+insert into fulloutput (object_name, object_schema, object_type, label1, object_definition1, label2, object_definition2, difference_type, difference_cause, importance)
+select r.object_name, r.object_schema, r.object_type, r.label1, r.object_definition1, r.label2, r.object_definition2, r.difference_type, NULL::text, r.importance
+from raw_differences r where r.difference_type in ('missing in 1st DB', 'missing in 2nd DB') and 
+not exists 
+(select 1 from expected_differences d where r.object_name = d.object_name and r.object_type = d.object_type);
+
+--- 5.  Expected...   mismatch, and explained...
+
+insert into fulloutput (object_name, object_schema, object_type, label1, object_definition1, label2, object_definition2, difference_type, difference_cause, importance)
+select r.object_name, r.object_schema, r.object_type, r.label1, r.object_definition1, r.label2, r.object_definition2, r.difference_type, d.difference_cause, r.importance
+from raw_differences r, expected_differences d where r.difference_type in ('mismatch') and 
+r.object_name = d.object_name and r.object_type = d.object_type;
+
+--- 6.  Not expected...   missing, and NOT explained...
+
+insert into fulloutput (object_name, object_schema, object_type, label1, object_definition1, label2, object_definition2, difference_type, difference_cause, importance)
+select r.object_name, r.object_schema, r.object_type, r.label1, r.object_definition1, r.label2, r.object_definition2, r.difference_type, NULL::text, r.importance
+from raw_differences r where r.difference_type in ('mismatch') and 
+not exists 
+(select 1 from expected_differences d where r.object_name = d.object_name and r.object_type = d.object_type);
+
+drop table if exists unexplained_items;
+create table unexplained_items (
+  object_name text,
+  object_schema text,
+  object_type text,
+  label1 text,
+  id1 integer,
+  object_definition1 text,
+  label2 text,
+  id2 integer,
+  object_definition2 text,
+  difference_type text,
+  importance integer
+);
+
+insert into unexplained_items (object_name, object_schema, object_type, label1, object_definition1, label2, object_definition2, difference_type, importance)
+select object_name, object_schema, object_type, label1, object_definition1, label2, object_definition2, difference_type, importance
+from raw_differences r
+where r.difference_type not in ('match') and
+not exists 
+(select 1 from expected_differences d where r.object_name = d.object_name and r.object_type = d.object_type);
+
+\\copy fulloutput to '${PGCFULLOUTPUT}';
+\\copy unexplained_items to '${PGCUNEXPLAINED}';
+
+drop table if exists badexplanations_items;
+create table badexplanations_items as
+select object_type, object_schema, object_name, difference_type, 'Not Yet Properly Explained'::text as difference_cause, importance
+from unexplained_items
+union all
+select object_type, object_schema, object_name, difference_type, 'Still Not Properly Explained'::text as difference_cause, importance
+from expected_differences where difference_cause in ('Not Properly Yet Explained', 'Still Not Properly Explained')
+union all
+select object_type, object_schema, object_name, difference_type, 'Misexplained', importance
+from expected_differences d 
+  where exists (select 1 from raw_differences r where r.object_type = d.object_type and r.object_name = d.object_name and r.difference_type <> d.difference_type);
+
+\echo Results Summary
+select object_type, difference_type, difference_cause, importance, count(*) from fulloutput group by 2, 1, 3, 4 order by 4, 2, 1, 3;
+
+\\copy badexplanations_items to '${PGCBADEXPLAIN}';
+
+\echo Inadequately Explained Items
+select object_type, object_name, difference_type, difference_cause, importance from badexplanations_items order by object_type, object_name;
+
+"
+    echo "${COMPARESCRIPT}" > ${PGCWORKDIR}/load-comparison-data.sql
+
+    ${PSQL} -d ${PGURI} -f ${PGCWORKDIR}/load-comparison-data.sql > ${PGCWORKDIR}/perform-comparison.log 2>&1 
+    retcode=$?
+    if [ $retcode -ne 0 ] 
+    then
+	echo "Could not run comparison against database PGDATABASE=${PGURI}" | tee -a $log_file
+	echo "See comparison log: ${PGCWORKDIR}/perform-comparison.log" | tee -a $log_file
+	exit 2
+    fi
+
+    if [ ! -f ${PGCBADEXPLAIN} ]
+    then
+	baditemcount=`wc -l ${PGCBADEXPLAIN}`
+	echo "Number of items inadequately explained: ${baditemcount}"  | tee -a $log_file
+	exit 3
+    fi
+
+}
+
+echo "Extracting schema data for ${DB1}" | tee -a $log_file
+extract_schema_data "${PGCLABEL1}" | ${PGBINDIR}/psql -q -d ${PGURI1}  > ${PGCMPOUTPUT1}
+retcode=$?
+if [ $retcode -ne 0 ]; then
+    echo "Could not extract schema data for label ${PGCLABEL1} from database PGDATABASE=${URI1}"  | tee -a $log_file
+    exit 1
+else
+    echo "Extracted schema data for ${PGURI1}"  | tee -a $log_file
+    ls -l ${PGCMPOUTPUT1}
+fi
+
+echo "Extracting schema data for ${DB2}" | tee -a $log_file
+extract_schema_data "${PGCLABEL2}" | ${PGBINDIR}/psql -q -d ${PGURI2}  > ${PGCMPOUTPUT2}
+retcode=$?
+if [ $retcode -ne 0 ]; then
+    echo "Could not extract schema data for label ${PGCLABEL2} from database PGDATABASE=${URI1}" | tee -a $log_file
+    exit 1
+else
+    echo "Extracted schema data for ${PGURI2}" | tee -a $log_file
+    ls -l ${PGCMPOUTPUT2}
+fi
+
+echo "Comparing schema data" | tee -a $log_file
+compare_data
+
+echo "Deleting comparisondatabase" | tee -a $log_file
+dropdb comparisondatabase
+
